@@ -28,16 +28,29 @@ negative (moving up). This is still a motion/flow-estimation technique
 (equivalent to phase correlation / PIV block matching), just one that
 integrates over a large window instead of a differential neighbourhood.
 
-Once both layers' velocities are known, the reveal is motion-compensated
-temporal averaging: shift every frame backward by a candidate layer's
-cumulative displacement and average the whole stack. The layer whose
-motion you compensated for lines back up frame after frame and reinforces;
-the other layer, now sliding at roughly double the relative speed, washes
-out to a flat tone (dots at any fixed compensated pixel become an
-uncorrelated sample from frame to frame). Subtracting the plain
+Once both layers' velocities are known, the default reveal is
+motion-compensated temporal averaging: shift every frame backward by a
+candidate layer's cumulative displacement and average the whole stack.
+The layer whose motion you compensated for lines back up frame after
+frame and reinforces; the other layer, now sliding at roughly double the
+relative speed, washes out to a flat tone. Subtracting the plain
 (uncompensated) temporal average removes whatever is common to every
 frame regardless of alignment (static compression artifacts, vignetting),
 leaving just the revealed layer's structure.
+
+That whole-clip approach assumes a layer's own dot pattern keeps its
+identity translating for the *entire* clip. On the reference footage that
+held for the message layer but not for the plain-noise layer -- its
+pairwise frame correlation collapses from strong to negligible within a
+few dozen frames, meaning its "noise" isn't one rigid texture but keeps
+partially regenerating. A whole-clip average of it just mixes decorrelated
+content into noise and buries whatever's embedded there. The fix
+(`local_median_reveal`) is to reconstruct from many short, independent
+windows short enough to stay inside that layer's coherence length,
+MEDIAN-combine each (robust to the other layer contaminating roughly half
+of any short window -- a mean isn't), and average the resulting images.
+This is in fact how a second, distinct hidden phrase was found on this
+footage's plain-noise layer, one the whole-clip method never surfaced.
 """
 
 from __future__ import annotations
@@ -192,6 +205,55 @@ def reveal_layer(
     return diff, valid
 
 
+DEFAULT_MEDIAN_WINDOW = 4   # half-width in frames of each short reconstruction
+DEFAULT_MEDIAN_STRIDE = 3   # frames between successive window centers
+
+
+def local_median_reveal(
+    frames: list[np.ndarray],
+    velocity: float,
+    window: int = DEFAULT_MEDIAN_WINDOW,
+    stride: int = DEFAULT_MEDIAN_STRIDE,
+) -> np.ndarray:
+    """Alternative reveal method for a layer whose own dot pattern doesn't
+    stay coherent for the whole clip -- see the module docstring. Slides a
+    small `2*window+1`-frame reconstruction across the clip (motion-
+    compensated, no wrap-around, same as `motion_compensated_average`),
+    takes the per-pixel MEDIAN of each one, and averages all of those
+    together. Median rather than mean within each short window because
+    the other, independently-moving layer still contaminates roughly half
+    of any short window's frames at a given pixel -- a mean would let
+    that contamination through, a median rejects it as long as it's a
+    minority of the window. Returns an image, not a diff -- no baseline
+    subtraction is needed since the median already suppresses the other
+    layer's contribution directly, and it's inverted (bright = ink) to
+    match the polarity `enhance` produces from `reveal_layer`.
+    """
+    h, w = frames[0].shape
+    acc = np.zeros((h, w), dtype=np.float64)
+    n_windows = 0
+    for center in range(window, len(frames) - window, stride):
+        idxs = range(center - window, center + window + 1)
+        stack = np.full((len(idxs), h, w), np.nan, dtype=np.float32)
+        for k, j in enumerate(idxs):
+            shift = int(round((j - center) * velocity))
+            if shift >= 0:
+                if shift >= h:
+                    continue
+                stack[k, : h - shift, :] = frames[j][shift:, :]
+            else:
+                s = -shift
+                if s >= h:
+                    continue
+                stack[k, s:, :] = frames[j][: h - s, :]
+        local_median = np.nanmedian(stack, axis=0)
+        acc += np.nan_to_num(local_median, nan=float(np.nanmean(local_median)))
+        n_windows += 1
+    if n_windows == 0:
+        raise ValueError("clip too short for the requested median window/stride")
+    return (255.0 - acc / n_windows).astype(np.float32)
+
+
 def enhance(
     diff: np.ndarray, valid: np.ndarray, blur_sigma_x: float = 18.0, blur_sigma_y: float = 6.0
 ) -> np.ndarray:
@@ -236,11 +298,33 @@ def to_uint8(img: np.ndarray) -> np.ndarray:
     return (out * 255).astype(np.uint8)
 
 
+def _resolve_method(method: str, layer_name: str) -> str:
+    if method != "auto":
+        return method
+    # Empirically, on the reference footage the message layer stays
+    # coherent for the whole clip (mean works great) while the plain-noise
+    # layer doesn't (needs median) -- see module docstring. This is a
+    # reasonable default, not a universal law; override with --method if
+    # a different clip behaves the other way.
+    return "median" if layer_name == "down" else "mean"
+
+
+def _reveal(
+    frames: list[np.ndarray], velocity: float, plain_avg: np.ndarray, method: str
+) -> np.ndarray:
+    if method == "median":
+        img = local_median_reveal(frames, velocity)
+        return enhance(img, np.ones(img.shape, dtype=bool))
+    diff, valid = reveal_layer(frames, velocity, plain_avg)
+    return enhance(diff, valid)
+
+
 def run(
     video_path: str,
     out_path: str,
-    layer: str = "up",
+    layer: str = "both",
     max_shift: int = DEFAULT_MAX_SHIFT,
+    method: str = "auto",
     save_diagnostics: bool = False,
 ) -> None:
     frames = load_gray_frames(video_path)
@@ -263,20 +347,21 @@ def run(
 
     plain_avg = np.mean(np.stack(frames), axis=0)
 
-    def build(v: float) -> np.ndarray:
-        diff, valid = reveal_layer(frames, v, plain_avg)
-        return enhance(diff, valid)
+    def build(v: float, layer_name: str) -> np.ndarray:
+        m = _resolve_method(method, layer_name)
+        print(f"revealing {layer_name} layer with method={m}", file=sys.stderr)
+        return _reveal(frames, v, plain_avg, m)
 
     if layer == "both":
         base, ext = out_path.rsplit(".", 1) if "." in out_path else (out_path, "png")
-        up_img = build(up_est.velocity)
-        down_img = build(down_est.velocity)
+        up_img = build(up_est.velocity, "up")
+        down_img = build(down_est.velocity, "down")
         cv2.imwrite(f"{base}_up.{ext}", up_img)
         cv2.imwrite(f"{base}_down.{ext}", down_img)
         print(f"wrote {base}_up.{ext} and {base}_down.{ext}", file=sys.stderr)
     else:
         v = up_est.velocity if layer == "up" else down_est.velocity
-        cv2.imwrite(out_path, build(v))
+        cv2.imwrite(out_path, build(v, layer))
         print(f"wrote {out_path}", file=sys.stderr)
 
     if save_diagnostics:
@@ -302,10 +387,20 @@ def main() -> None:
     parser.add_argument(
         "--layer",
         choices=["up", "down", "both"],
-        default="up",
-        help="which motion layer to reveal: the one translating upward, downward, "
-        "or both (default: up, matching the described 'message moves up, "
-        "noise moves down' construction)",
+        default="both",
+        help="which motion layer to reveal (default: both -- on the reference "
+        "footage each layer carries a different, independent hidden phrase)",
+    )
+    parser.add_argument(
+        "--method",
+        choices=["auto", "mean", "median"],
+        default="auto",
+        help="reveal algorithm: 'mean' is whole-clip motion-compensated averaging "
+        "(reveal_layer), 'median' is the short-window median approach "
+        "(local_median_reveal) for a layer whose own dot pattern doesn't stay "
+        "coherent for the whole clip, 'auto' (default) picks mean for the "
+        "upward layer and median for the downward one, matching what worked "
+        "on the reference footage",
     )
     parser.add_argument(
         "--max-shift",
@@ -316,11 +411,12 @@ def main() -> None:
     parser.add_argument(
         "--diagnostics",
         action="store_true",
-        help="also save the plain temporal average and un-enhanced diffs for both layers",
+        help="also save the plain temporal average and un-enhanced mean-method diffs "
+        "for both layers",
     )
     args = parser.parse_args()
     run(args.video, args.output, layer=args.layer, max_shift=args.max_shift,
-        save_diagnostics=args.diagnostics)
+        method=args.method, save_diagnostics=args.diagnostics)
 
 
 if __name__ == "__main__":
