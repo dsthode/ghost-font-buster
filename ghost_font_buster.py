@@ -254,6 +254,118 @@ def local_median_reveal(
     return (255.0 - acc / n_windows).astype(np.float32)
 
 
+DRIFT_CHUNK_FRAMES = 20     # frames per chunk used to sample the secondary drift
+DRIFT_STRIDE = 12           # frames between successive chunk centers
+DRIFT_MAX_SHIFT = 250       # search radius (px) for matching chunks against each other
+DRIFT_MIN_CONFIDENCE = 0.5  # below this correlation, don't trust/apply the drift estimate
+DRIFT_SIGNIFICANCE_PX = 8   # below this much total range, correction isn't worth the cost
+
+
+def _global_shift(a: np.ndarray, b: np.ndarray, max_shift: int) -> tuple[int, int, float]:
+    """Coarse 2D translation of `b` relative to `a`, searched over a wide
+    range via cv2.matchTemplate (an optimized C implementation -- a Python
+    loop over a range this wide is too slow to be practical). Returns
+    (dy, dx, confidence) where positive dy/dx means b's content sits
+    below/right of where it is in a. Confidence is the correlation
+    coefficient at the match, comparable to the other correlation values
+    used throughout this module."""
+    a_pad = cv2.copyMakeBorder(a, max_shift, max_shift, max_shift, max_shift, cv2.BORDER_REPLICATE)
+    res = cv2.matchTemplate(a_pad, b, cv2.TM_CCOEFF_NORMED)
+    _, maxval, _, maxloc = cv2.minMaxLoc(res)
+    dy = -(maxloc[1] - max_shift)
+    dx = -(maxloc[0] - max_shift)
+    return dy, dx, float(maxval)
+
+
+def estimate_secondary_drift(
+    frames: list[np.ndarray],
+    velocity: float,
+    chunk_frames: int = DRIFT_CHUNK_FRAMES,
+    stride: int = DRIFT_STRIDE,
+    max_shift: int = DRIFT_MAX_SHIFT,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Detect a slow secondary 2D drift riding on top of a layer's primary
+    per-frame velocity -- e.g. a diagonal wander or screensaver-style
+    bounce superimposed on the fast scroll. This is far too slow (a
+    fraction of a pixel per frame) for the differential frame-to-frame
+    block matching that finds the primary velocity to pick up reliably,
+    but it integrates to many pixels over the length of a clip, so it
+    shows up clearly comparing widely-separated reconstructions instead:
+    reconstruct many short, primary-velocity-compensated chunks spanning
+    the whole clip, and cross-correlate each against the first with
+    `_global_shift`. Returns (centers, dy, dx, confidence) sample arrays,
+    one entry per chunk (the first is the reference, all zeros).
+    """
+    n = len(frames)
+    half = chunk_frames // 2
+    centers = list(range(half, n - half, stride))
+    if len(centers) < 2:
+        return np.array(centers), np.zeros(len(centers)), np.zeros(len(centers)), np.ones(len(centers))
+    imgs = []
+    for c in centers:
+        img = local_median_reveal(frames[c - half : c + half], velocity, window=4, stride=2)
+        imgs.append(enhance(img, np.ones(img.shape, dtype=bool)))
+    dys, dxs, confs = [0.0], [0.0], [1.0]
+    for img in imgs[1:]:
+        dy, dx, conf = _global_shift(imgs[0], img, max_shift)
+        dys.append(float(dy))
+        dxs.append(float(dx))
+        confs.append(conf)
+    return np.array(centers), np.array(dys), np.array(dxs), np.array(confs)
+
+
+def local_median_reveal_2d(
+    frames: list[np.ndarray],
+    velocity: float,
+    sec_dy: np.ndarray,
+    sec_dx: np.ndarray,
+    window: int = DEFAULT_MEDIAN_WINDOW,
+    stride: int = DEFAULT_MEDIAN_STRIDE,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Like `local_median_reveal`, but also cancels a slow secondary 2D
+    drift (per-frame arrays, e.g. from interpolating `estimate_secondary_drift`
+    samples). Each short window is still only compensated for the primary
+    velocity internally -- the drift's own contribution over such a short
+    span is negligible -- but the window's whole reconstructed image is
+    then placed on a shared canvas at an offset that cancels *that
+    window's* accumulated drift, so windows from every point in the clip
+    reinforce the same absolute structure instead of the drift smearing
+    them apart. (Naively folding the drift into the intra-window shift
+    instead of doing this doesn't work: it cancels out of the within-
+    window arithmetic and never actually gets applied.) Returns (image,
+    valid) like `reveal_layer`, since the shared canvas is now larger than
+    the frame and only partially covered by any given window.
+    """
+    h, w = frames[0].shape
+    pad = int(np.ceil(max(sec_dy.max() - sec_dy.min(), sec_dx.max() - sec_dx.min()))) + 2
+    ch, cw = h + 2 * pad, w + 2 * pad
+    acc = np.zeros((ch, cw), dtype=np.float64)
+    count = np.zeros((ch, cw), dtype=np.float64)
+    for center in range(window, len(frames) - window, stride):
+        idxs = range(center - window, center + window + 1)
+        stack = np.full((len(idxs), h, w), np.nan, dtype=np.float32)
+        for k, j in enumerate(idxs):
+            shift = int(round((j - center) * velocity))
+            if shift >= 0:
+                if shift >= h:
+                    continue
+                stack[k, : h - shift, :] = frames[j][shift:, :]
+            else:
+                s = -shift
+                if s >= h:
+                    continue
+                stack[k, s:, :] = frames[j][: h - s, :]
+        local_median = np.nanmedian(stack, axis=0)
+        local_median = np.nan_to_num(local_median, nan=float(np.nanmean(local_median)))
+        gy = pad - int(round(sec_dy[center]))
+        gx = pad - int(round(sec_dx[center]))
+        acc[gy : gy + h, gx : gx + w] += local_median
+        count[gy : gy + h, gx : gx + w] += 1
+    avg = np.divide(acc, count, out=np.zeros_like(acc), where=count > 0)
+    valid = count >= MIN_SAMPLE_FRACTION * count.max() if count.max() > 0 else count > 0
+    return (255.0 - avg).astype(np.float32), valid
+
+
 def enhance(
     diff: np.ndarray, valid: np.ndarray, blur_sigma_x: float = 18.0, blur_sigma_y: float = 6.0
 ) -> np.ndarray:
@@ -310,9 +422,34 @@ def _resolve_method(method: str, layer_name: str) -> str:
 
 
 def _reveal(
-    frames: list[np.ndarray], velocity: float, plain_avg: np.ndarray, method: str
+    frames: list[np.ndarray],
+    velocity: float,
+    plain_avg: np.ndarray,
+    method: str,
+    drift_correction: str = "auto",
 ) -> np.ndarray:
     if method == "median":
+        if drift_correction != "off":
+            centers, sec_dy, sec_dx, confs = estimate_secondary_drift(frames, velocity)
+            if len(centers) > 1:
+                drift_range = max(sec_dy.max() - sec_dy.min(), sec_dx.max() - sec_dx.min())
+                confident = np.median(confs[1:]) >= DRIFT_MIN_CONFIDENCE
+                use_drift = confident and (
+                    drift_correction == "on" or drift_range >= DRIFT_SIGNIFICANCE_PX
+                )
+                print(
+                    f"secondary drift check: range={drift_range:.1f}px "
+                    f"confidence={np.median(confs[1:]):.2f} "
+                    f"-> {'applying 2D correction' if use_drift else 'not significant, skipping'}",
+                    file=sys.stderr,
+                )
+                if use_drift:
+                    n = len(frames)
+                    idx = np.arange(n)
+                    interp_dy = np.interp(idx, centers, sec_dy, left=sec_dy[0], right=sec_dy[-1])
+                    interp_dx = np.interp(idx, centers, sec_dx, left=sec_dx[0], right=sec_dx[-1])
+                    img, valid = local_median_reveal_2d(frames, velocity, interp_dy, interp_dx)
+                    return enhance(img, valid)
         img = local_median_reveal(frames, velocity)
         return enhance(img, np.ones(img.shape, dtype=bool))
     diff, valid = reveal_layer(frames, velocity, plain_avg)
@@ -325,6 +462,7 @@ def run(
     layer: str = "both",
     max_shift: int = DEFAULT_MAX_SHIFT,
     method: str = "auto",
+    drift_correction: str = "auto",
     save_diagnostics: bool = False,
 ) -> None:
     frames = load_gray_frames(video_path)
@@ -350,7 +488,7 @@ def run(
     def build(v: float, layer_name: str) -> np.ndarray:
         m = _resolve_method(method, layer_name)
         print(f"revealing {layer_name} layer with method={m}", file=sys.stderr)
-        return _reveal(frames, v, plain_avg, m)
+        return _reveal(frames, v, plain_avg, m, drift_correction=drift_correction)
 
     if layer == "both":
         base, ext = out_path.rsplit(".", 1) if "." in out_path else (out_path, "png")
@@ -409,6 +547,18 @@ def main() -> None:
         help=f"maximum per-frame pixel shift to search for (default: {DEFAULT_MAX_SHIFT})",
     )
     parser.add_argument(
+        "--drift-correction",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="correct for a slow secondary 2D drift on top of the primary velocity "
+        "(a diagonal wander or screensaver-style bounce, too slow for the primary "
+        "velocity estimate to see but which integrates to a real, visible smear over "
+        "the clip) -- only applies to the median method. 'auto' (default) detects "
+        "and corrects it only if the measured drift is confidently large enough to "
+        "matter; 'on' always applies it if a confident measurement exists; 'off' "
+        "disables the check entirely",
+    )
+    parser.add_argument(
         "--diagnostics",
         action="store_true",
         help="also save the plain temporal average and un-enhanced mean-method diffs "
@@ -416,7 +566,8 @@ def main() -> None:
     )
     args = parser.parse_args()
     run(args.video, args.output, layer=args.layer, max_shift=args.max_shift,
-        method=args.method, save_diagnostics=args.diagnostics)
+        method=args.method, drift_correction=args.drift_correction,
+        save_diagnostics=args.diagnostics)
 
 
 if __name__ == "__main__":

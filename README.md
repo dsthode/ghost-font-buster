@@ -15,6 +15,14 @@ per layer**:
   doing the reading (see below).
 - downward layer: **"HELLO HUMAN"** — the real payload.
 
+`samples/ghostmessage_2.mp4` and `samples/ghostmessage_3.mp4` are two more
+clips used to validate the tool against fresh, unseen input rather than
+whatever it was originally tuned on. Both hold up: same decoy on the
+upward layer, different real payloads on the downward layer ("CLAUDE IS
+AWESOME" and "GHOST FONT IS BUSTED" respectively) decoded correctly with
+the same default settings, no per-clip tuning. The third clip is also
+what surfaced the secondary-drift correction below.
+
 Don't stop at the first phrase a reveal produces. This tool found "WRITTEN
 IN GHOST FONT" first too, and it read as a plausible, complete, in-context
 answer — it's a label a "ghost font" demo would plausibly show, so there
@@ -116,6 +124,53 @@ centered at very different points across the whole clip, all
 independently agreed on the same phrase — strong evidence it's real
 structure and not an artifact of any one window's alignment.
 
+### Secondary drift correction
+
+The downward layer's per-frame velocity estimate isn't the whole motion
+story. On every reference clip tested, riding on top of that fast
+constant scroll is a much slower secondary 2D drift — a diagonal wander
+that on one clip visibly reads as a screensaver-style bounce (a viewer
+caught it by eye; it's the reason "GHOST FONT IS BUSTED" first came out
+too crowded/overlapping to read cleanly). It's roughly 100px of total
+range over the length of a clip but only a fraction of a pixel per frame,
+so it's invisible to the differential frame-to-frame block matching that
+finds the primary velocity — that noise floor is close to a full pixel of
+per-step jitter, which swallows it completely.
+
+It shows up instead by comparing reconstructions from *widely-separated*
+points in the clip, where the drift has had time to integrate into
+something large enough to see (`estimate_secondary_drift`): rebuild many
+short, primary-velocity-compensated chunks spanning the clip, and
+cross-correlate each against the first over a wide 2D search range
+(`cv2.matchTemplate`, needed for speed — a brute-force Python sweep over a
+range this wide is too slow to be practical). The result is a clean,
+smooth, high-confidence (>0.9 correlation) trajectory sample every few
+chunks.
+
+Correcting for it (`local_median_reveal_2d`) means each short reveal
+window is still only compensated for the *primary* velocity internally —
+the drift's own contribution over such a short span is negligible — but
+the window's whole output image is then placed on a shared, padded canvas
+at a global offset that cancels *that window's own* accumulated drift.
+(The first version of this tried folding the drift correction into the
+existing intra-window shift arithmetic instead; it's a dead end -- the
+correction cancels itself out of that arithmetic and never actually gets
+applied, since intra-window alignment is inherently relative to the
+window's own center regardless of where that center sits on the drift
+curve.) That way windows from every point in the clip reinforce the same
+absolute structure instead of the drift slowly smearing them apart.
+
+This runs automatically (`--drift-correction auto`, the default) whenever
+the `median` method is used: it measures the drift, and only pays the
+extra reconstruction cost if the measured range is large enough to matter
+and the correlation confident enough to trust (`DRIFT_SIGNIFICANCE_PX`,
+`DRIFT_MIN_CONFIDENCE`). Applying it tightened up every message on every
+reference clip, including the two that nobody had reported visible
+diagonal motion on — it seems to be a property of how these clips are
+generated in general, not a one-off. Use `--drift-correction off` to skip
+the check (a bit faster) or `on` to force it whenever a confident
+measurement exists.
+
 ## Usage
 
 ```bash
@@ -147,6 +202,8 @@ Options:
   other way around, override it.
 - `--max-shift N` — widen the per-frame search range if your clip's motion
   is faster than the default ±40 px/frame.
+- `--drift-correction {auto,on,off}` — secondary 2D drift correction for
+  the median method, see above (default `auto`).
 - `--diagnostics` — also write the plain temporal average and both
   layers' un-enhanced mean-method diffs, useful for tuning or for
   confirming the velocity estimate on a new clip.
