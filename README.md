@@ -5,22 +5,50 @@ analysis — no OCR, no ML model, just cross-correlation and statistics.
 
 ## Origins
 
-The technique this defeats comes from [mixfont.com/ghost-font](https://www.mixfont.com/ghost-font),
-which demonstrates a way to encode text into a video so that it's
-(claimed to be) legible to a human watching but indiscernible to an AI
-looking at individual frames. The pitch is essentially a captcha inverted:
-instead of distorting text so *only* a human can read it, the message
-never exists as static contrast anywhere — it's built entirely out of
-*motion*, a channel single-frame vision models don't see and single-frame
-OCR has nothing to grab onto.
+The technique this defeats comes from [mixfont.com/ghost-font](https://www.mixfont.com/ghost-font)
+("Ghost Font"). In the site's own words: it's "an anti-AI font that
+writes a message using motion. Using a combination of motion, video,
+noise, and decoys, it's a unique way to share a message with other real
+humans... not as legible as regular text, [but] the letters are still
+immediately readable to a human eye, [while] even leading AI models can't
+decipher it easily." It traces its lineage to ZXX, a 2013 typeface by
+designer Sang Mun built to be human-readable but resist OCR — "deemed
+'surveillance-proof'" at the time, per the site, before modern AI made
+short work of it. Ghost Font is pitched as that same idea's successor,
+moving the camouflage from static glyph distortion into motion, a channel
+single-frame OCR and single-frame vision models don't see at all.
 
-This repo's origin is a straightforward hypothesis about that claim: if
-the message is encoded as motion, then a machine vision technique that
-operates on motion — rather than on any single frame — should be able to
-recover it just as well as a human eye can, defeating the "unreadable to
-AI" half of the pitch. That hypothesis is what got tested here, and it
-held up: every sample clip decodes cleanly with the methods below, no
-manual tuning per clip.
+The site's own writeup is refreshingly honest that "AI" isn't a fixed bar:
+it shows two frontier models given a Ghost Font clip and told to figure
+out the message, without being told anything about how it was encoded. In
+one screenshot, a model reads the video by averaging its raw frames,
+correctly recovers the *decoy* text this way, and reports that as the
+answer — never finding the real payload the decoy is designed to draw
+attention away from. In another, given full tool access (able to run its
+own Python), a model gets there anyway, by computing per-pixel temporal
+standard deviation across the raw frames (no motion compensation at all —
+letter regions apparently flicker noticeably less over time than the pure
+noise around them) and correctly decodes a different real message. The
+site's framing is that both only really got there once "prompted with the
+exact technique to look for."
+
+That's exactly the shape this repo's development took, worth naming
+plainly rather than glossing over: this tool did not one-shot every
+message either. It read the decoy first and initially reported that as
+the answer, same as the model in the site's own demo. It took being told
+outright that wasn't the real message, an explicit prompt toward the
+"track and subtract the noise layer" technique, and later a specific
+report of visible diagonal motion, to end up at what's here. The
+throughline for both this repo and the site's own examples is the same:
+general-purpose reasoning plus the right nudge toward a signal-processing
+technique gets there; blind frame-by-frame inspection does not. What
+*is* demonstrated here, and is worth being direct about since it cuts
+against the site's "even leading AI models can't decipher it easily"
+framing: once you know motion (or, per the site's own std-dev example,
+even just temporal statistics without motion) is the channel to exploit,
+recovering the message doesn't require an AI model *reading* the video at
+all — cross-correlation and pixel statistics are enough, and they
+generalize cleanly across every clip tried, with zero per-clip tuning.
 
 ## The mechanism
 
@@ -207,6 +235,27 @@ instead of a cleaner image.) Low-confidence regions (see methods 3 and 5
 above) are excluded from both the blur and the percentile stretch via a
 normalized convolution, rather than being allowed to skew them, and are
 rendered as flat mid-gray in the output.
+
+### A simpler alternative that also works
+
+Everything above tracks and compensates for motion because that's the
+channel Ghost Font's pitch centers on. But it turns out that isn't the
+only exploitable signal here, and it's worth being upfront that it isn't
+even the simplest one. The source site's own writeup includes a session
+where a model with tool access decodes a Ghost Font clip a completely
+different way: no velocity estimation, no motion compensation at all —
+just the per-pixel temporal standard deviation across the raw frame
+stack, on the observation that pixels inside the letters flicker
+noticeably less over time than the surrounding pure noise. Tried against
+`samples/ghostmessage.mp4` here, it works — `stack.std(axis=0)`, inverted
+and contrast-stretched, cleanly reveals "WRITTEN IN GHOST FONT" in a
+handful of lines with no per-frame velocity, no alignment, and no
+reveal-method selection. It doesn't replace what's here (it doesn't
+appear to isolate the *two* independent messages the way `--layer up` /
+`--layer down` does, at least not without more digging), but it's a
+useful sanity check on a new clip, and a good reminder to check whether a
+simpler statistic solves a problem before reaching for the more involved
+motion-modeling machinery.
 
 ## Usage
 
