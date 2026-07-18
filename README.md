@@ -94,6 +94,24 @@ the other layer, sitting the whole time behind a bug in the first attempt
 at reading that layer. Treat both layers' output as a first draft, not a
 confirmed answer, until you've looked for a second phrase and found none.
 
+## Example
+
+`media/ghostmessage_3.mp4` — every frame of this looks like plain static;
+open it and see for yourself:
+
+<video src="media/ghostmessage_3.mp4" controls width="480"></video>
+
+*(GitHub strips `<video>` from rendered README files, so if you're reading
+this on GitHub that tag won't play — [download/view the file directly](media/ghostmessage_3.mp4)
+instead. It renders fine in a local Markdown preview or on other hosts.)*
+
+Running `python ghost_font_buster.py media/ghostmessage_3.mp4 --layer down`
+against it (`--drift-correction on`, the default, since this is the clip
+that surfaced it) decodes the downward layer to this, straight out of the
+tool with no manual cleanup:
+
+![Decoded downward-layer message reading GHOST FONT IS BUSTED](media/ghostmessage_3_decoded.png)
+
 ## Algorithms used
 
 ### 1. Why not plain optical flow
