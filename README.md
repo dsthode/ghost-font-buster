@@ -160,16 +160,17 @@ window's own center regardless of where that center sits on the drift
 curve.) That way windows from every point in the clip reinforce the same
 absolute structure instead of the drift slowly smearing them apart.
 
-This runs automatically (`--drift-correction auto`, the default) whenever
-the `median` method is used: it measures the drift, and only pays the
-extra reconstruction cost if the measured range is large enough to matter
-and the correlation confident enough to trust (`DRIFT_SIGNIFICANCE_PX`,
-`DRIFT_MIN_CONFIDENCE`). Applying it tightened up every message on every
-reference clip, including the two that nobody had reported visible
-diagonal motion on — it seems to be a property of how these clips are
-generated in general, not a one-off. Use `--drift-correction off` to skip
-the check (a bit faster) or `on` to force it whenever a confident
-measurement exists.
+This runs automatically (`--drift-correction on`, the default) whenever
+the `median` method is used. Applying it tightened up every message on
+every reference clip tested, including the two that nobody had reported
+visible diagonal motion on before checking — it isn't a one-off property
+of a single clip, it appears to be inherent to how this whole format of
+video is generated, so it defaults to *always* applying whenever a
+confident correlation measurement exists (`DRIFT_MIN_CONFIDENCE`) rather
+than gating on the measured drift also being large (that gate is still
+available as `--drift-correction auto`, for a clip where you specifically
+want to avoid the extra reconstruction cost unless it's worth it). Use
+`--drift-correction off` to skip the check entirely.
 
 ## Usage
 
@@ -203,7 +204,7 @@ Options:
 - `--max-shift N` — widen the per-frame search range if your clip's motion
   is faster than the default ±40 px/frame.
 - `--drift-correction {auto,on,off}` — secondary 2D drift correction for
-  the median method, see above (default `auto`).
+  the median method, see above (default `on`).
 - `--diagnostics` — also write the plain temporal average and both
   layers' un-enhanced mean-method diffs, useful for tuning or for
   confirming the velocity estimate on a new clip.

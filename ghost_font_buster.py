@@ -462,7 +462,7 @@ def run(
     layer: str = "both",
     max_shift: int = DEFAULT_MAX_SHIFT,
     method: str = "auto",
-    drift_correction: str = "auto",
+    drift_correction: str = "on",
     save_diagnostics: bool = False,
 ) -> None:
     frames = load_gray_frames(video_path)
@@ -549,14 +549,16 @@ def main() -> None:
     parser.add_argument(
         "--drift-correction",
         choices=["auto", "on", "off"],
-        default="auto",
+        default="on",
         help="correct for a slow secondary 2D drift on top of the primary velocity "
         "(a diagonal wander or screensaver-style bounce, too slow for the primary "
         "velocity estimate to see but which integrates to a real, visible smear over "
-        "the clip) -- only applies to the median method. 'auto' (default) detects "
-        "and corrects it only if the measured drift is confidently large enough to "
-        "matter; 'on' always applies it if a confident measurement exists; 'off' "
-        "disables the check entirely",
+        "the clip) -- only applies to the median method. 'on' (default) applies it "
+        "whenever a confident measurement exists, since it's shown up on every "
+        "reference clip tested and appears to be inherent to how they're generated, "
+        "not something to detect case by case; 'auto' only applies it if the measured "
+        "drift is also large enough to be worth the extra cost; 'off' disables the "
+        "check entirely",
     )
     parser.add_argument(
         "--diagnostics",
