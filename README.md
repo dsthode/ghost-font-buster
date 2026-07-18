@@ -77,13 +77,11 @@ decodes to **two independent messages, one per layer**:
   doing the reading (see "don't stop at the first phrase" below).
 - downward layer: **"HELLO HUMAN"** — the real payload.
 
-`samples/ghostmessage_2.mp4` and `samples/ghostmessage_3.mp4` are two more
-clips used to validate the tool against fresh, unseen input rather than
-whatever it was originally tuned on. Both hold up: same decoy on the
-upward layer, different real payloads on the downward layer ("CLAUDE IS
-AWESOME" and "GHOST FONT IS BUSTED" respectively) decoded correctly with
-the same default settings, no per-clip tuning. The third clip is also
-what surfaced the secondary-drift correction described below.
+`samples/ghostmessage_2.mp4` is one more clip used to validate the tool 
+against fresh, unseen input rather than whatever it was originally tuned 
+on. It holds up: same decoy on the upward layer, different real payload 
+on the downward layer ("GHOST FONT IS BUSTED") decoded correctly with
+the same default settings, no per-clip tuning.
 
 Don't stop at the first phrase a reveal produces. This tool found "WRITTEN
 IN GHOST FONT" first too, and it read as a plausible, complete, in-context
@@ -93,6 +91,24 @@ wasn't the real message before digging further turned up "HELLO HUMAN" on
 the other layer, sitting the whole time behind a bug in the first attempt
 at reading that layer. Treat both layers' output as a first draft, not a
 confirmed answer, until you've looked for a second phrase and found none.
+
+## Example
+
+`media/ghostmessage_2.mp4` — every frame of this looks like plain static;
+open it and see for yourself:
+
+<video src="media/ghostmessage_2.mp4" controls width="480"></video>
+
+*(GitHub strips `<video>` from rendered README files, so if you're reading
+this on GitHub that tag won't play — [download/view the file directly](media/ghostmessage_2.mp4)
+instead. It renders fine in a local Markdown preview or on other hosts.)*
+
+Running `python ghost_font_buster.py media/ghostmessage_2.mp4 --layer down`
+against it (`--drift-correction on`, the default, since this is the clip
+that surfaced it) decodes the downward layer to this, straight out of the
+tool with no manual cleanup:
+
+![Decoded downward-layer message reading GHOST FONT IS BUSTED](media/ghostmessage_2_decoded.png)
 
 ## Algorithms used
 
@@ -235,27 +251,6 @@ instead of a cleaner image.) Low-confidence regions (see methods 3 and 5
 above) are excluded from both the blur and the percentile stretch via a
 normalized convolution, rather than being allowed to skew them, and are
 rendered as flat mid-gray in the output.
-
-### A simpler alternative that also works
-
-Everything above tracks and compensates for motion because that's the
-channel Ghost Font's pitch centers on. But it turns out that isn't the
-only exploitable signal here, and it's worth being upfront that it isn't
-even the simplest one. The source site's own writeup includes a session
-where a model with tool access decodes a Ghost Font clip a completely
-different way: no velocity estimation, no motion compensation at all —
-just the per-pixel temporal standard deviation across the raw frame
-stack, on the observation that pixels inside the letters flicker
-noticeably less over time than the surrounding pure noise. Tried against
-`samples/ghostmessage.mp4` here, it works — `stack.std(axis=0)`, inverted
-and contrast-stretched, cleanly reveals "WRITTEN IN GHOST FONT" in a
-handful of lines with no per-frame velocity, no alignment, and no
-reveal-method selection. It doesn't replace what's here (it doesn't
-appear to isolate the *two* independent messages the way `--layer up` /
-`--layer down` does, at least not without more digging), but it's a
-useful sanity check on a new clip, and a good reminder to check whether a
-simpler statistic solves a problem before reaching for the more involved
-motion-modeling machinery.
 
 ## Usage
 
