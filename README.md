@@ -39,12 +39,20 @@ positive (the layer moving down), one negative (the layer moving up).
    then combine across the clip with a median — robust to the odd
    stalled/duplicated frame some encoders emit at the start.
 2. **Motion-compensate and average.** For a candidate layer velocity `v`,
-   shift frame `i` backward by `round(i * v)` pixels (wrapping — the dot
-   fields tile seamlessly) and average the whole stack
-   (`motion_compensated_average`). Content moving at `v` lines back up
-   every frame and reinforces; the other layer, now sliding at roughly
+   shift frame `i` backward by `round(i * v)` pixels and average the whole
+   stack (`motion_compensated_average`). Content moving at `v` lines back
+   up every frame and reinforces; the other layer, now sliding at roughly
    double the relative speed, decorrelates frame to frame and washes out
-   to a flat gray.
+   to a flat gray. This is a one-way scroll, not a looping/tileable
+   texture — fresh content enters from one edge each frame and old content
+   permanently exits the other, confirmed by inspecting the raw footage.
+   So the shift is applied with each frame contributing only to the rows
+   it actually has data for (no wrap-around), and each row is normalized
+   by how many frames actually covered it. That count necessarily tapers
+   off away from the reference frame — content near a layer's exit edge
+   has less time on screen before it scrolls out of view — so rows near
+   the edge of the output are averaged over far fewer samples than the
+   interior and are noticeably noisier as a result.
 3. **Subtract the plain temporal average.** Averaging the raw,
    unaligned frames captures whatever is identical in every frame
    regardless of alignment — static compression grain, vignetting.
@@ -55,7 +63,11 @@ positive (the layer moving down), one negative (the layer moving up).
    vertical-grain residue. A blur that's wider horizontally than
    vertically kills that grain (it's much finer than a letter) while
    barely softening the letters themselves, followed by a plain percentile
-   contrast stretch.
+   contrast stretch. Both the blur and the percentile range are computed
+   as a normalized convolution over just the well-sampled rows from step
+   2 (see `MIN_SAMPLE_FRACTION`) — otherwise the noisy, low-sample edge
+   rows would bleed into the blur and skew the contrast stretch. Those
+   edge rows are rendered as flat mid-gray in the output instead.
 
 ## Usage
 

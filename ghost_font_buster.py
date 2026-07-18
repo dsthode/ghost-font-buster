@@ -147,24 +147,54 @@ def estimate_layer_velocities(
 def motion_compensated_average(frames: list[np.ndarray], velocity: float) -> np.ndarray:
     """Average every frame after undoing `velocity` px/frame of vertical
     translation, using frame 0 as the reference. Layer content moving at
-    `velocity` becomes stationary and reinforces; everything else smears."""
+    `velocity` becomes stationary and reinforces; everything else smears.
+
+    This is a one-way scroll, not a looping/tileable texture: each frame,
+    fresh content enters from one edge and old content permanently exits
+    the other (confirmed by watching the raw footage -- the trailing edge
+    does not reappear at the leading edge). So a naive np.roll (wrap-around)
+    is wrong: it would splice unrelated rows together at the seam and
+    corrupt every frame once the cumulative shift exceeds the frame height.
+    Instead, accumulate only over the rows each frame actually has valid
+    data for, and normalize by the per-row count of contributing frames
+    (which tapers off away from the reference frame, since content nearer
+    the exit edge has less time before it scrolls out of view).
+    """
     h, w = frames[0].shape
     acc = np.zeros((h, w), dtype=np.float64)
+    count = np.zeros((h, w), dtype=np.float64)
     for i, frame in enumerate(frames):
         shift = int(round(i * velocity))
-        # np.roll (wrap-around) rather than a zero/replicate border: the
-        # dot fields tile seamlessly, confirmed empirically by alignment
-        # quality at large frame offsets being just as good as at small ones.
-        acc += np.roll(frame, -shift, axis=0)
-    return (acc / len(frames)).astype(np.float32)
+        if shift >= 0:
+            if shift >= h:
+                continue
+            acc[: h - shift, :] += frame[shift:, :]
+            count[: h - shift, :] += 1
+        else:
+            s = -shift
+            if s >= h:
+                continue
+            acc[s:, :] += frame[: h - s, :]
+            count[s:, :] += 1
+    avg = np.divide(acc, count, out=np.zeros_like(acc), where=count > 0).astype(np.float32)
+    return avg, count
 
 
-def reveal_layer(frames: list[np.ndarray], velocity: float, plain_avg: np.ndarray) -> np.ndarray:
-    aligned = motion_compensated_average(frames, velocity)
-    return aligned - plain_avg
+MIN_SAMPLE_FRACTION = 0.15  # rows with fewer than this fraction of frames contributing are unreliable
 
 
-def enhance(diff: np.ndarray, blur_sigma_x: float = 18.0, blur_sigma_y: float = 6.0) -> np.ndarray:
+def reveal_layer(
+    frames: list[np.ndarray], velocity: float, plain_avg: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    aligned, count = motion_compensated_average(frames, velocity)
+    diff = aligned - plain_avg
+    valid = count >= MIN_SAMPLE_FRACTION * len(frames)
+    return diff, valid
+
+
+def enhance(
+    diff: np.ndarray, valid: np.ndarray, blur_sigma_x: float = 18.0, blur_sigma_y: float = 6.0
+) -> np.ndarray:
     """Denoise and contrast-stretch a revealed-layer image for readability.
 
     The residual noise left after motion-compensated averaging is a thin,
@@ -176,11 +206,28 @@ def enhance(diff: np.ndarray, blur_sigma_x: float = 18.0, blur_sigma_y: float = 
     is enough after that; CLAHE was tried and rejected here -- its local
     tiling re-amplifies exactly the fine-grained residual grain the blur
     just suppressed, producing blotchy artifacts instead of a cleaner image.
+
+    Rows near the scroll's exit edge (see `motion_compensated_average`) are
+    only averaged over a handful of frames, so they're much noisier than
+    the rest of the image -- close to raw single-frame contrast rather than
+    the well-averaged interior. Blurring naively would bleed that noise
+    into the valid region at the boundary, and including it in the contrast
+    stretch would let a few extreme outlier pixels wash out the real
+    signal. `valid` marks which pixels are trustworthy; the blur is a
+    normalized convolution restricted to them, and the percentile stretch
+    ignores everything else.
     """
-    blurred = cv2.GaussianBlur(diff, (0, 0), sigmaX=blur_sigma_x, sigmaY=blur_sigma_y)
-    lo, hi = np.percentile(blurred, [1, 99])
+    maskf = valid.astype(np.float32)
+    blurred_signal = cv2.GaussianBlur(diff * maskf, (0, 0), sigmaX=blur_sigma_x, sigmaY=blur_sigma_y)
+    blurred_mask = cv2.GaussianBlur(maskf, (0, 0), sigmaX=blur_sigma_x, sigmaY=blur_sigma_y)
+    blurred = np.divide(
+        blurred_signal, blurred_mask, out=np.zeros_like(blurred_signal), where=blurred_mask > 1e-6
+    )
+    lo, hi = np.percentile(blurred[valid], [1, 99])
     stretched = np.clip((blurred - lo) / (hi - lo + 1e-6), 0, 1)
-    return (stretched * 255).astype(np.uint8)
+    img8 = (stretched * 255).astype(np.uint8)
+    img8[~valid] = 128
+    return img8
 
 
 def to_uint8(img: np.ndarray) -> np.ndarray:
@@ -217,7 +264,8 @@ def run(
     plain_avg = np.mean(np.stack(frames), axis=0)
 
     def build(v: float) -> np.ndarray:
-        return enhance(reveal_layer(frames, v, plain_avg))
+        diff, valid = reveal_layer(frames, v, plain_avg)
+        return enhance(diff, valid)
 
     if layer == "both":
         base, ext = out_path.rsplit(".", 1) if "." in out_path else (out_path, "png")
@@ -234,14 +282,12 @@ def run(
     if save_diagnostics:
         base, ext = out_path.rsplit(".", 1) if "." in out_path else (out_path, "png")
         cv2.imwrite(f"{base}_diag_plain_average.{ext}", to_uint8(plain_avg))
-        cv2.imwrite(
-            f"{base}_diag_raw_diff_up.{ext}",
-            to_uint8(reveal_layer(frames, up_est.velocity, plain_avg)),
-        )
-        cv2.imwrite(
-            f"{base}_diag_raw_diff_down.{ext}",
-            to_uint8(reveal_layer(frames, down_est.velocity, plain_avg)),
-        )
+        up_diff, up_valid = reveal_layer(frames, up_est.velocity, plain_avg)
+        down_diff, down_valid = reveal_layer(frames, down_est.velocity, plain_avg)
+        up_diff[~up_valid] = 0
+        down_diff[~down_valid] = 0
+        cv2.imwrite(f"{base}_diag_raw_diff_up.{ext}", to_uint8(up_diff))
+        cv2.imwrite(f"{base}_diag_raw_diff_down.{ext}", to_uint8(down_diff))
         print(f"wrote diagnostic images alongside {out_path}", file=sys.stderr)
 
 
